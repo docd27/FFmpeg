@@ -8,6 +8,10 @@
 
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
+
+#include "libavutil/time.h"
+// For int64_t av_gettime_relative(void);
+
 #include "avdevice.h"
 
 #include <sys/time.h>
@@ -18,10 +22,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-typedef struct baka_timer {
-    int last_sec;
-    int last_usec;
-} baka_timer_t;
+#include <x86intrin.h>
+
+// Workaround for missing intrinsics
+#define _mm_loadu_si32(MEM) _mm_castps_si128(_mm_load_ss((float const*)(MEM)))
+#define _mm_storeu_si32(MEM, VAL) _mm_store_ss((float*)(MEM), _mm_castsi128_ps(VAL))
 
 typedef struct baka_bitmap_info {
     int bpp;
@@ -54,13 +59,8 @@ typedef struct BAKAContext {
     int             antialias_mode;
     char            *charset;
     int             charset_mode;
-
-    // Timers:
-    baka_timer_t    timer;
-    int             lastticks;
-    int             rendertime;
-
-    int             delay; // Frametime, usec
+    int             syncwait;
+    // int             syncstats;
 
     // Bitmap info:
     baka_bitmap_info_t bitmap;
@@ -71,6 +71,38 @@ typedef struct BAKAContext {
     char            *screen_buffer;
     size_t          screen_buffer_size;
 
+    // Timing:
+
+    AVRational      time_base;
+    int64_t         pts_rel; // Starts at zero
+    int64_t         pts;
+
+    int64_t         duration_nominal;
+    int64_t         duration;
+    int64_t         duration_last;
+
+    // First frame tick counts:
+    int64_t         ticks_first_frame;
+    int64_t         pts_first_frame;
+
+    int64_t         last_pts_rel;
+    int64_t         last_draw_time;
+    int64_t         last_present_time;
+
+    // Lag due to excess draw times which we can skip ahead to compensate for
+    int64_t         lag_skipahead;
+
+    // Stats
+    int64_t         stats_delay; // Current lag of pts_end to actual time
+    int64_t         count_reclock; // Frames adjusted to match VFR
+
+    int64_t         reclock_drift;
+
+    int64_t         count_backwards; // Frames where time went backwards
+
+    int64_t         count_skip;  // Frames we skipped
+    int64_t         count_guess; // Frames missing a pkt->duration
+
 } BAKAContext;
 
 #define ANTIALIAS_MODE_NORMAL 1
@@ -79,12 +111,13 @@ typedef struct BAKAContext {
 #define CHARSET_MODE_NORMAL 1
 #define CHARSET_MODE_ETB 2
 
-// #define DEBUG_ATTR __attribute__ ((noinline))
-#define DEBUG_ATTR
+#define DEBUG_ATTR __attribute__ ((noinline))
+//#define DEBUG_ATTR
 
-#define FORCE_INLINE __attribute__((always_inline)) inline
-//#define FORCE_INLINE
+//#define FORCE_INLINE __attribute__((always_inline)) inline
+#define FORCE_INLINE
 
+#define BAKA_SSE2 1
 
 static void die(const char* msg) {
   fprintf(stderr, "Fatal error: %s", msg);
@@ -233,6 +266,10 @@ static void DEBUG_ATTR baka_bitmap_get_rgba_default(baka_bitmap_info_t const *d,
 #define MAX(x, y) (((x) > (y)) ? (x) : (y))
 #define CLAMP(x, low, high)  (((x) > (high)) ? (high) : (((x) < (low)) ? (low) : (x)))
 
+
+
+
+
 static int DEBUG_ATTR baka_bitmap_draw(BAKAContext* c, int x, int y, int w, int h,
                         baka_bitmap_info_t const *d, void const *pixels) {
 
@@ -255,9 +292,13 @@ static int DEBUG_ATTR baka_bitmap_draw(BAKAContext* c, int x, int y, int w, int 
         for(x = x1 > 0 ? x1 : 0; x <= x2 && x < c->window_width; x++) {
 
             int fromx, fromy, tox, toy, myx, myy, dots;
+            #ifdef BAKA_SSE2
+              __m128 rgba_mm;
+              __m128i rgba_load_mm;
+              __m128 dots_mm;
+            #endif
             uint32_t rgb[3];
 
-            uint32_t outch;
             baka_symbol_t *dest_sym;
 
             dest_sym = c->symbol_buffer + (y * c->window_width) + x;
@@ -273,52 +314,106 @@ static int DEBUG_ATTR baka_bitmap_draw(BAKAContext* c, int x, int y, int w, int 
             if(tox == fromx) tox++;
             if(toy == fromy) toy++;
 
-            /// TODO: optimize by making rgb a SIMD/AVX vector for the parallel load/add/divides
-            /// and rewrite/replace baka_bitmap_get_rgb_24bpp()
-            /// Expected speedup: ~2x
-            /// and baka_bitmap_draw() + baka_bitmap_get_rgb_24bpp() use 30% of cpu time
-            /// So ~15% saving on total load possible
-
             if (c->antialias_mode == ANTIALIAS_MODE_HALF && (toy - fromy >= 2)) {
                 int halfy = fromy + ((toy - fromy)/2);
 
                 dots = 0;
-                rgb[0] = rgb[1] = rgb[2] = 0;
+                #ifdef BAKA_SSE2
+                  rgba_mm = _mm_setzero_ps();
+                #else
+                  rgb[0] = rgb[1] = rgb[2] = 0;
+                #endif
+
 
                 for(myy = fromy; myy < halfy; myy++)
                     for(myx = fromx; myx < tox; myx++)
                 {
                     dots++;
-                    baka_bitmap_get_rgb_24bpp(d, pixels, myx, myy, rgb);
+                    #ifdef BAKA_SSE2
+                      // Little endian:
+                      rgba_load_mm = _mm_loadu_si32(((uint8_t const *)pixels) + 3 * myx + d->pitch * myy);
+
+                      // Unpack:
+                      rgba_load_mm = _mm_cvtepu8_epi32(rgba_load_mm);
+
+
+                      rgba_mm = _mm_add_ps(rgba_mm, _mm_cvtepi32_ps(rgba_load_mm));
+                      // rgba_mm += (float) rgba_load_mm
+                    # else
+                      baka_bitmap_get_rgb_24bpp(d, pixels, myx, myy, rgb);
+                    #endif
                 }
+                #ifdef BAKA_SSE2
+                  dots_mm = _mm_set1_ps(1.0f / ((float)dots));
+                  // dots_mm = [1 / dots, 1 / dots, 1/ dots, 1 / dots]
+                  rgba_mm = _mm_mul_ps(rgba_mm, dots_mm);
+                  // rbga_mm *= dots_mm
+                  rgba_load_mm = _mm_cvttps_epi32(rgba_mm);
+                  // rgba_load_mm = ints
 
-                /* Normalize */
-                rgb[0] /= dots;
-                rgb[1] /= dots;
-                rgb[2] /= dots;
+                  // Pack:
+                  rgba_load_mm = _mm_packs_epi32(rgba_load_mm, rgba_load_mm);
+                  rgba_load_mm = _mm_packus_epi16(rgba_load_mm, rgba_load_mm);
 
-                dest_sym->fg.r = rgb[0];
-                dest_sym->fg.g = rgb[1];
-                dest_sym->fg.b = rgb[2];
+                  _mm_storeu_si32(&dest_sym->fg, rgba_load_mm);
+                # else
+                  /* Normalize */
+                  rgb[0] /= dots;
+                  rgb[1] /= dots;
+                  rgb[2] /= dots;
+
+                  dest_sym->fg.r = rgb[0];
+                  dest_sym->fg.g = rgb[1];
+                  dest_sym->fg.b = rgb[2];
+                #endif
 
                 dots = 0;
-                rgb[0] = rgb[1] = rgb[2] = 0;
+                #ifdef BAKA_SSE2
+                  rgba_mm = _mm_setzero_ps();
+                #else
+                  rgb[0] = rgb[1] = rgb[2] = 0;
+                #endif
 
                 for(myy = halfy; myy < toy; myy++)
                     for(myx = fromx; myx < tox; myx++)
                 {
                     dots++;
-                    baka_bitmap_get_rgb_24bpp(d, pixels, myx, myy, rgb);
+                    #ifdef BAKA_SSE2
+                      // Little endian:
+                      rgba_load_mm = _mm_loadu_si32(((uint8_t const *)pixels) + 3 * myx + d->pitch * myy);
+                      // Unpack:
+                      rgba_load_mm = _mm_cvtepu8_epi32(rgba_load_mm);
+
+                      rgba_mm = _mm_add_ps(rgba_mm, _mm_cvtepi32_ps(rgba_load_mm));
+                      // rgba_mm += (float) rgba_load_mm
+                    # else
+                      baka_bitmap_get_rgb_24bpp(d, pixels, myx, myy, rgb);
+                    #endif
                 }
 
-                /* Normalize */
-                rgb[0] /= dots;
-                rgb[1] /= dots;
-                rgb[2] /= dots;
+                #ifdef BAKA_SSE2
+                  dots_mm = _mm_set1_ps(1.0f / ((float)dots));
+                  // dots_mm = [1 / dots, 1 / dots, 1/ dots, 1 / dots]
+                  rgba_mm = _mm_mul_ps(rgba_mm, dots_mm);
+                  // rbga_mm *= dots_mm
+                  rgba_load_mm = _mm_cvttps_epi32(rgba_mm);
+                  // rgba_load_mm = ints
 
-                dest_sym->bg.r = rgb[0];
-                dest_sym->bg.g = rgb[1];
-                dest_sym->bg.b = rgb[2];
+                  // Pack:
+                  rgba_load_mm = _mm_packs_epi32(rgba_load_mm, rgba_load_mm);
+                  rgba_load_mm = _mm_packus_epi16(rgba_load_mm, rgba_load_mm);
+
+                  _mm_storeu_si32(&dest_sym->bg, rgba_load_mm);
+                # else
+                  /* Normalize */
+                  rgb[0] /= dots;
+                  rgb[1] /= dots;
+                  rgb[2] /= dots;
+
+                  dest_sym->bg.r = rgb[0];
+                  dest_sym->bg.g = rgb[1];
+                  dest_sym->bg.b = rgb[2];
+                #endif
 
                 dest_sym->char_utf32 = 0x2580; // Top half block
             } else {
@@ -370,55 +465,32 @@ static int DEBUG_ATTR baka_init(BAKAContext *c) {
     c->symbol_buffer = NULL;
     c->symbol_buffer_size = 0;
 
-    c->timer.last_sec = 0;
-    c->timer.last_usec = 0;
-    c->lastticks = 0;
-    c->rendertime = 0;
-    c->delay = 0;
-
     return 0;
-}
-
-static int DEBUG_ATTR baka_getticks(baka_timer_t *timer) {
-    // Adapted from _caca_getticks((), linux time.h only
-    struct timeval tv;
-    int ticks = 0;
-    int new_sec, new_usec;
-    gettimeofday(&tv, NULL);
-    new_sec = tv.tv_sec;
-    new_usec = tv.tv_usec;
-
-    if(timer->last_sec != 0)
-    {
-        /* If the delay was greater than 60 seconds, return 10 seconds
-         * otherwise we may overflow our ticks counter. */
-        if(new_sec >= timer->last_sec + 60)
-            ticks = 60 * 1000000;
-        else
-        {
-            ticks = (new_sec - timer->last_sec) * 1000000;
-            ticks += new_usec;
-            ticks -= timer->last_usec;
-        }
-    }
-    timer->last_sec = new_sec;
-    timer->last_usec = new_usec;
-
-    return ticks;
-}
-
-static void DEBUG_ATTR baka_sleep(int usec) {
-    usleep(usec);
 }
 
 #define ANSIRGB24_FG_FORMAT "\x1b[38;2;%hhu;%hhu;%hhum"
 #define ANSIRGB24_BG_FORMAT "\x1b[48;2;%hhu;%hhu;%hhum"
 const size_t ANSIRGB24_SIZE = sizeof("\x1b[38;2;255;255;255m") - 1; // No null byte
 
-#define FRAME_START "\x1B[0;0f"
+// Cursor off, position 0,0
+#define FRAME_START "\x1b[?25l\x1b[0;0f"
 const size_t FRAME_START_SIZE = sizeof(FRAME_START) - 1;
 
-#define FRAME_END "\x1b[0m"
+
+#define INT64_FORMAT_F(_F) _F("%+019ld")
+#define INT64_SIZE_F(_F) sizeof(_F("+9223372036854775807"))-1
+
+
+#define FRAME_HEADER_STR(_VAL) _VAL", "_VAL", "_VAL", "_VAL", "_VAL", "_VAL", "_VAL", "_VAL", "_VAL"\n"
+#define FRAME_HEADER_FORMAT INT64_FORMAT_F(FRAME_HEADER_STR)
+const size_t FRAME_HEADER_SIZE = INT64_SIZE_F(FRAME_HEADER_STR);
+
+#define FRAME_STATS_STR(_VAL) "D:"_VAL" A:"_VAL" R:"_VAL" K:"_VAL" B:"_VAL" G:"_VAL" S:"_VAL"\n"
+#define FRAME_STATS_FORMAT INT64_FORMAT_F(FRAME_STATS_STR)
+const size_t FRAME_STATS_SIZE = INT64_SIZE_F(FRAME_STATS_STR);
+
+// Cursor on, reset color
+#define FRAME_END "\x1b[?25h\x1b[0m"
 // PRE: |FRAME_END_ETB| <= |FRAME_END|
 #define FRAME_END_ETB "\x17"
 const size_t FRAME_END_SIZE = sizeof(FRAME_END) - 1;
@@ -432,8 +504,14 @@ static int DEBUG_ATTR baka_draw_display(BAKAContext *c) {
 
     baka_symbol_t *src_sym = c->symbol_buffer;
 
-    if (c->charset_mode == CHARSET_MODE_NORMAL)
+    if (c->charset_mode == CHARSET_MODE_NORMAL) {
         screen += sprintf(screen, "%s", FRAME_START);
+        // printf("0m%+012ld, %012ld\n", c->pts, c->duration);
+    }
+    screen += sprintf(screen, FRAME_HEADER_FORMAT, c->pts, c->duration, c->stats_delay, c->lag_skipahead, c->count_reclock, c->reclock_drift, c->count_backwards, c->count_guess, c->count_skip);
+    // if (c->syncstats) {
+    //   screen += sprintf(screen, FRAME_STATS_FORMAT, c->stats_delay, c->lag_skipahead, c->count_reclock, c->reclock_drift, c->count_backwards, c->count_guess, c->count_skip);
+    // }
 
     for (y = 0; y < height; y++)
     {
@@ -472,44 +550,19 @@ static int DEBUG_ATTR baka_draw_display(BAKAContext *c) {
     return 0;
 }
 
-static int DEBUG_ATTR baka_refresh_display(BAKAContext *c) {
-#   define IDLE_USEC 5000
-    int ticks = c->lastticks + baka_getticks(&c->timer);
-
-    baka_draw_display(c);
-
-    /* Wait until dp->delay + time of last call */
-    ticks += baka_getticks(&c->timer);
-    for(ticks += baka_getticks(&c->timer);
-        ticks + IDLE_USEC < (int)c->delay;
-        ticks += baka_getticks(&c->timer))
-    {
-        baka_sleep(IDLE_USEC);
-    }
-
-    /* Update the render time */
-    c->rendertime = ticks;
-
-    c->lastticks = ticks - c->delay;
-
-    /* If we drifted too much, it's bad, bad, bad. */
-    if(c->lastticks > (int)c->delay)
-        c->lastticks = 0;
-
-    return 0;
-}
-
 #define FRAME_CLEAR "\x1B[0;0f\x1B[2J\x1B[0;0f"
 
 static int DEBUG_ATTR baka_init_graphics(BAKAContext *c) {
     c->screen_buffer_size =
         c->window_width * c->window_height * (
-          4 +  // Max UTF-8 bytes
+          4 +  // UTF-32 bytes
           ANSIRGB24_SIZE + // BG
           ANSIRGB24_SIZE // FG
         ) +
         c->window_height * 1 + // Newlines
         FRAME_START_SIZE +
+        FRAME_HEADER_SIZE +
+        FRAME_STATS_SIZE +
         FRAME_END_SIZE; // Constant
     c->screen_buffer = av_malloc(c->screen_buffer_size * sizeof(char));
     if(c->screen_buffer == NULL)
@@ -621,7 +674,26 @@ static int DEBUG_ATTR baka_write_header(AVFormatContext *s) {
         goto fail;
     }
 
-    c->delay = av_rescale_q(1, st->codec->time_base, AV_TIME_BASE_Q);
+    // Timing init:
+    c->time_base = st->time_base;
+    c->duration_nominal = av_rescale_q(1, c->time_base, AV_TIME_BASE_Q);
+    c->duration_last = c->duration_nominal;
+    c->ticks_first_frame = 0;
+    c->pts_first_frame = 0;
+
+    c->last_draw_time = 0;
+    c->last_present_time = 0;
+    c->last_pts_rel = 0;
+
+    c->lag_skipahead = 0;
+
+    // Stats init:
+    c->stats_delay = 0;
+    c->count_reclock = 0;
+    c->reclock_drift = 0;
+    c->count_backwards = 0;
+    c->count_skip = 0;
+    c->count_guess = 0;
 
     return 0;
 
@@ -630,13 +702,119 @@ fail:
     return ret;
 }
 
+#define SLEEP_MIN_USEC 1000
 static int DEBUG_ATTR baka_write_packet(AVFormatContext *s, AVPacket *pkt) {
     // Each frame:
     BAKAContext *c = s->priv_data;
 
-    baka_bitmap_draw(c, 0, 0, c->window_width, c->window_height, &c->bitmap, pkt->data);
+    int64_t ticks_dts_start;
+    int64_t ticks_dts_end;
+    int64_t ticks_sleep;
+    int64_t ticks_pts_start;
+    int64_t ticks_pts_end;
 
-    baka_refresh_display(c);
+    int64_t frame_lag;
+    int64_t clock_drift;
+
+
+    c->pts = av_rescale_q(pkt->pts, c->time_base, AV_TIME_BASE_Q);
+    if (c->ticks_first_frame && (
+      c->pts - c->pts_first_frame < c->last_pts_rel
+    )) { // Time went backwards! (loaded another chunk of an HLSL stream)
+      c->pts_first_frame = c->pts - c->last_pts_rel - c->duration_last;
+      // We are going to set c->pts_rel = c->pts - c->pts_first_frame;
+      // Therefore
+      // c->pts_rel = c->pts - (c->pts - c->last_pts_rel - c->duration_last);
+      // so c->pts_rel = c->last_pts_rel + c->duration_last
+
+      // c->stats_reclock_drift += (c->pts_first_frame - pts_first_frame_prev);
+      c->count_backwards++;
+    }
+    c->pts_rel = c->pts - c->pts_first_frame;
+
+    // Set frame duration
+    if (pkt->duration > 0) {
+      c->duration = av_rescale_q(pkt->duration, c->time_base, AV_TIME_BASE_Q);
+    } else {
+      // Guess frame duration based on last / nominal
+      c->duration = c->duration_last;
+      c->count_guess++;
+    }
+
+    // Adjust frame duration (VFR stream)
+    clock_drift = (c->pts_rel - c->last_pts_rel) - c->duration_last;
+    if (c->ticks_first_frame && clock_drift) {
+      /*
+      Inconsistent last frame timestamps and durations!
+         - Usually due to VFR, or 59.94 vs 60 fps etc
+      Since pts (frame timestamp) is king, this means
+      c->duration_last should have been += clock_drift
+      but since we can't travel back in time to alter that frame
+          (without a 1 frame buffer which is also a possible solution here)
+      alter the duration of _this_ frame instead, so at least the timestamps are consistent
+          and shift this frame's timestamp back
+          this is technically incorrect but at least the timestamps are now consistent
+      Then we have pts0 + duration = pts1 precisely for all frames
+      */
+
+      c->count_reclock++;
+      c->duration += clock_drift;
+      c->pts_rel -= clock_drift;
+      c->reclock_drift += clock_drift;
+    }
+
+    ticks_dts_start = av_gettime_relative();
+
+    if (c->ticks_first_frame &&
+        (c->lag_skipahead >= c->duration) &&
+        (
+          (ticks_dts_start - c->ticks_first_frame) + c->last_draw_time + c->last_present_time
+          > c->pts_rel + c->duration
+        )
+      ) { // Skip this frame
+      c->count_skip++;
+      c->lag_skipahead -= c->duration;
+      c->stats_delay = (ticks_dts_start - c->ticks_first_frame) - c->pts_rel;
+    } else {
+    // if ((!c->ticks_first_frame) || (
+    //     (ticks_dts_start - c->ticks_first_frame) + c->last_draw_time + c->last_present_time
+    //     <= c->pts_rel + c->duration)
+    //     ) {
+      // Can draw
+      baka_bitmap_draw(c, 0, 0, c->window_width, c->window_height, &c->bitmap, pkt->data);
+      ticks_dts_end = av_gettime_relative();
+
+      if (c->syncwait && c->ticks_first_frame) {
+        ticks_sleep = (c->pts_rel + c->duration) - (ticks_dts_end - c->ticks_first_frame + c->last_present_time);
+
+        if (ticks_sleep >= SLEEP_MIN_USEC)
+          usleep(ticks_sleep);
+      }
+
+      ticks_pts_start = av_gettime_relative();
+      baka_draw_display(c);
+      ticks_pts_end = av_gettime_relative();
+
+      c->last_draw_time = ticks_dts_end - ticks_dts_start;
+      c->last_present_time = ticks_pts_end - ticks_pts_start;
+
+      if (!c->ticks_first_frame) {
+        c->ticks_first_frame = ticks_pts_end;
+        c->pts_first_frame = c->pts;
+      }
+
+      frame_lag = c->last_draw_time + c->last_present_time;
+      if (frame_lag > c->duration) { // This frame took too long to draw, add to skipahead
+        c->lag_skipahead += frame_lag - c->duration;
+      }
+
+      c->stats_delay = (ticks_pts_end - c->ticks_first_frame) - (c->pts_rel + c->duration);
+
+    }
+
+    c->duration_last = c->duration;
+    c->last_pts_rel = c->pts_rel;
+
     return 0;
 }
 
@@ -647,6 +825,8 @@ static const AVOption options[] = {
     { "window_size",  "set window forced size",  OFFSET(window_width), AV_OPT_TYPE_IMAGE_SIZE, {.str = NULL }, 0, 0, ENC},
     { "antialias",    "set antialias method",    OFFSET(antialias), AV_OPT_TYPE_STRING, {.str = "default" }, 0, 0, ENC },
     { "charset",      "set output charset",      OFFSET(charset), AV_OPT_TYPE_STRING, {.str = "default" }, 0, 0, ENC },
+    { "syncwait",     "frame sync (delay)",      OFFSET(syncwait), AV_OPT_TYPE_BOOL, {.i64=1}, 0, 1, ENC },
+    // { "syncstats",    "print sync stats",        OFFSET(syncstats), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, ENC },
     { NULL },
 };
 
