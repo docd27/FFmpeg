@@ -59,7 +59,7 @@ typedef struct BAKAContext {
     int             antialias_mode;
     char            *charset;
     int             charset_mode;
-    int             syncwait;
+    int             sync;
     // int             syncstats;
 
     // Bitmap info:
@@ -89,8 +89,22 @@ typedef struct BAKAContext {
     int64_t         last_draw_time;
     int64_t         last_present_time;
 
+    // Buffering:
+    double          syncbuffer;
+    // Threshold at which to try to decrease buffer
+    int64_t         syncbuffer_usec;
+    // Wait this long after increasing before decreasing
+    int64_t         syncbuffer_decrease_after_increase_usec;
+
+    int64_t         last_packet_ticks;
+    int64_t         buffer_ticks;
+    int64_t         last_decrease_buffer_ticks;
+    int64_t         last_increase_buffer_ticks;
+
     // Lag due to excess draw times which we can skip ahead to compensate for
     int64_t         lag_skipahead;
+
+
 
     // Stats
     int64_t         stats_delay; // Current lag of pts_end to actual time
@@ -481,11 +495,11 @@ const size_t FRAME_START_SIZE = sizeof(FRAME_START) - 1;
 #define INT64_SIZE_F(_F) sizeof(_F("+9223372036854775807"))-1
 
 
-#define FRAME_HEADER_STR(_VAL) _VAL", "_VAL", "_VAL", "_VAL", "_VAL", "_VAL", "_VAL", "_VAL", "_VAL"\n"
+#define FRAME_HEADER_STR(_VAL) _VAL", "_VAL", "_VAL", "_VAL", "_VAL", "_VAL", "_VAL", "_VAL", "_VAL", "_VAL"\n"
 #define FRAME_HEADER_FORMAT INT64_FORMAT_F(FRAME_HEADER_STR)
 const size_t FRAME_HEADER_SIZE = INT64_SIZE_F(FRAME_HEADER_STR);
 
-#define FRAME_STATS_STR(_VAL) "D:"_VAL" A:"_VAL" R:"_VAL" K:"_VAL" B:"_VAL" G:"_VAL" S:"_VAL"\n"
+#define FRAME_STATS_STR(_VAL) "B:"_VAL" D:"_VAL" A:"_VAL" R:"_VAL" K:"_VAL" B:"_VAL" G:"_VAL" S:"_VAL"\n"
 #define FRAME_STATS_FORMAT INT64_FORMAT_F(FRAME_STATS_STR)
 const size_t FRAME_STATS_SIZE = INT64_SIZE_F(FRAME_STATS_STR);
 
@@ -508,7 +522,7 @@ static int DEBUG_ATTR baka_draw_display(BAKAContext *c) {
         screen += sprintf(screen, "%s", FRAME_START);
         // printf("0m%+012ld, %012ld\n", c->pts, c->duration);
     }
-    screen += sprintf(screen, FRAME_HEADER_FORMAT, c->pts, c->duration, c->stats_delay, c->lag_skipahead, c->count_reclock, c->reclock_drift, c->count_backwards, c->count_guess, c->count_skip);
+    screen += sprintf(screen, FRAME_HEADER_FORMAT, c->pts_rel, c->duration, c->buffer_ticks, c->stats_delay, c->lag_skipahead, c->count_reclock, c->reclock_drift, c->count_backwards, c->count_guess, c->count_skip);
     // if (c->syncstats) {
     //   screen += sprintf(screen, FRAME_STATS_FORMAT, c->stats_delay, c->lag_skipahead, c->count_reclock, c->reclock_drift, c->count_backwards, c->count_guess, c->count_skip);
     // }
@@ -597,6 +611,7 @@ static int DEBUG_ATTR baka_write_trailer(AVFormatContext *s) {
     return 0;
 }
 
+#define USECS_PER_SEC 1000000.0L
 static int DEBUG_ATTR baka_write_header(AVFormatContext *s) {
     // INIT:
 
@@ -687,6 +702,14 @@ static int DEBUG_ATTR baka_write_header(AVFormatContext *s) {
 
     c->lag_skipahead = 0;
 
+    c->buffer_ticks = 0;
+    c->last_packet_ticks = 0;
+    c->last_increase_buffer_ticks = 0;
+    c->last_decrease_buffer_ticks = 0;
+
+    c->syncbuffer_usec = (int64_t)(c->syncbuffer * USECS_PER_SEC);
+    c->syncbuffer_decrease_after_increase_usec = c->syncbuffer_usec<<1; // *2
+
     // Stats init:
     c->stats_delay = 0;
     c->count_reclock = 0;
@@ -701,10 +724,11 @@ fail:
     baka_write_trailer(s);
     return ret;
 }
-
 #define SLEEP_MIN_USEC 1000
 static int DEBUG_ATTR baka_write_packet(AVFormatContext *s, AVPacket *pkt) {
     // Each frame:
+
+    int64_t packet_ticks = av_gettime_relative(); // timestamp packet arrival
     BAKAContext *c = s->priv_data;
 
     int64_t ticks_dts_start;
@@ -716,8 +740,23 @@ static int DEBUG_ATTR baka_write_packet(AVFormatContext *s, AVPacket *pkt) {
     int64_t frame_lag;
     int64_t clock_drift;
 
+    int64_t packet_lag;
+    int64_t frametime_half;
 
     c->pts = av_rescale_q(pkt->pts, c->time_base, AV_TIME_BASE_Q);
+    // Adjust the timestamp based on buffer:
+    c->pts += c->buffer_ticks;
+
+    // Set frame duration
+    if (pkt->duration > 0) {
+      c->duration = av_rescale_q(pkt->duration, c->time_base, AV_TIME_BASE_Q);
+    } else {
+      // Guess frame duration based on last / nominal
+      c->duration = c->duration_last;
+      c->count_guess++;
+    }
+
+    // Set pts_rel to be always monotonic
     if (c->ticks_first_frame && (
       c->pts - c->pts_first_frame < c->last_pts_rel
     )) { // Time went backwards! (loaded another chunk of an HLSL stream)
@@ -731,15 +770,6 @@ static int DEBUG_ATTR baka_write_packet(AVFormatContext *s, AVPacket *pkt) {
       c->count_backwards++;
     }
     c->pts_rel = c->pts - c->pts_first_frame;
-
-    // Set frame duration
-    if (pkt->duration > 0) {
-      c->duration = av_rescale_q(pkt->duration, c->time_base, AV_TIME_BASE_Q);
-    } else {
-      // Guess frame duration based on last / nominal
-      c->duration = c->duration_last;
-      c->count_guess++;
-    }
 
     // Adjust frame duration (VFR stream)
     clock_drift = (c->pts_rel - c->last_pts_rel) - c->duration_last;
@@ -756,12 +786,37 @@ static int DEBUG_ATTR baka_write_packet(AVFormatContext *s, AVPacket *pkt) {
           this is technically incorrect but at least the timestamps are now consistent
       Then we have pts0 + duration = pts1 precisely for all frames
       */
-
       c->count_reclock++;
       c->duration += clock_drift;
       c->pts_rel -= clock_drift;
+      // c->pts -= clock_drift; // for consistency
       c->reclock_drift += clock_drift;
     }
+
+    // Buffering by adjusting pts timestamps
+    if (c->sync && c->ticks_first_frame &&
+        (c->lag_skipahead < c->duration) // Can't skipahead
+        ) {
+        packet_lag = packet_ticks - c->last_packet_ticks - c->last_draw_time - c->last_present_time - c->duration_last;
+        if (packet_lag > 0) {
+          c->duration += packet_lag; // Stretch current frame
+          c->buffer_ticks += packet_lag; // Adjust timestamp of next frame
+          c->last_increase_buffer_ticks = packet_ticks;
+        } else {
+          frametime_half = c->duration>>1;
+          if ((c->buffer_ticks >= c->syncbuffer_usec) &&
+              ((packet_ticks - c->last_increase_buffer_ticks) >= c->syncbuffer_decrease_after_increase_usec) &&
+              (c->buffer_ticks >= frametime_half)) {
+            // TODO: scale frame times instead of skipping
+            // Skip a frame to reduce the buffer
+            c->buffer_ticks -= frametime_half; // Adjust timestamp of next frame
+            // c->lag_skipahead += frametime_half; // And allow skipahead;
+            c->duration = frametime_half;
+          }
+        }
+    }
+    c->last_packet_ticks = packet_ticks;
+
 
     ticks_dts_start = av_gettime_relative();
 
@@ -775,6 +830,8 @@ static int DEBUG_ATTR baka_write_packet(AVFormatContext *s, AVPacket *pkt) {
       c->count_skip++;
       c->lag_skipahead -= c->duration;
       c->stats_delay = (ticks_dts_start - c->ticks_first_frame) - c->pts_rel;
+      c->last_draw_time = 0;
+      c->last_present_time = 0;
     } else {
     // if ((!c->ticks_first_frame) || (
     //     (ticks_dts_start - c->ticks_first_frame) + c->last_draw_time + c->last_present_time
@@ -784,7 +841,7 @@ static int DEBUG_ATTR baka_write_packet(AVFormatContext *s, AVPacket *pkt) {
       baka_bitmap_draw(c, 0, 0, c->window_width, c->window_height, &c->bitmap, pkt->data);
       ticks_dts_end = av_gettime_relative();
 
-      if (c->syncwait && c->ticks_first_frame) {
+      if (c->sync && c->ticks_first_frame) {
         ticks_sleep = (c->pts_rel + c->duration) - (ticks_dts_end - c->ticks_first_frame + c->last_present_time);
 
         if (ticks_sleep >= SLEEP_MIN_USEC)
@@ -803,12 +860,17 @@ static int DEBUG_ATTR baka_write_packet(AVFormatContext *s, AVPacket *pkt) {
         c->pts_first_frame = c->pts;
       }
 
-      frame_lag = c->last_draw_time + c->last_present_time;
-      if (frame_lag > c->duration) { // This frame took too long to draw, add to skipahead
-        c->lag_skipahead += frame_lag - c->duration;
-      }
+      if (c->sync) {
 
-      c->stats_delay = (ticks_pts_end - c->ticks_first_frame) - (c->pts_rel + c->duration);
+        frame_lag = c->last_draw_time + c->last_present_time;
+        if (frame_lag > c->duration) { // This frame took too long to draw, add to skipahead
+          c->lag_skipahead += frame_lag - c->duration;
+        }
+
+        c->stats_delay = (ticks_pts_end - c->ticks_first_frame) - (c->pts_rel + c->duration);
+      } else {
+        c->stats_delay = 0;
+      }
 
     }
 
@@ -825,7 +887,8 @@ static const AVOption options[] = {
     { "window_size",  "set window forced size",  OFFSET(window_width), AV_OPT_TYPE_IMAGE_SIZE, {.str = NULL }, 0, 0, ENC},
     { "antialias",    "set antialias method",    OFFSET(antialias), AV_OPT_TYPE_STRING, {.str = "default" }, 0, 0, ENC },
     { "charset",      "set output charset",      OFFSET(charset), AV_OPT_TYPE_STRING, {.str = "default" }, 0, 0, ENC },
-    { "syncwait",     "frame sync (delay)",      OFFSET(syncwait), AV_OPT_TYPE_BOOL, {.i64=1}, 0, 1, ENC },
+    { "sync",         "frame sync (delay+skip)",      OFFSET(sync), AV_OPT_TYPE_BOOL, {.i64=1}, 0, 1, ENC },
+    { "syncbuffer",   "target buffer size (seconds)", OFFSET(syncbuffer), AV_OPT_TYPE_DOUBLE, {.dbl=0}, 0, 60, ENC },
     // { "syncstats",    "print sync stats",        OFFSET(syncstats), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, ENC },
     { NULL },
 };
