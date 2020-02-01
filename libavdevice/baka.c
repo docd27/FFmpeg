@@ -81,6 +81,12 @@ typedef struct BAKAContext {
     int64_t         duration;
     int64_t         duration_last;
 
+    int64_t         canonical_pts;
+    int64_t         canonical_pts_rel;
+    int64_t         canonical_last_pts_rel;
+    int64_t         canonical_duration;
+    int64_t         canonical_duration_last;
+
     // First frame tick counts:
     int64_t         ticks_first_frame;
     int64_t         pts_first_frame;
@@ -125,11 +131,11 @@ typedef struct BAKAContext {
 #define CHARSET_MODE_NORMAL 1
 #define CHARSET_MODE_ETB 2
 
-#define DEBUG_ATTR __attribute__ ((noinline))
-//#define DEBUG_ATTR
+//#define DEBUG_ATTR __attribute__ ((noinline))
+#define DEBUG_ATTR
 
-//#define FORCE_INLINE __attribute__((always_inline)) inline
-#define FORCE_INLINE
+#define FORCE_INLINE __attribute__((always_inline)) inline
+//#define FORCE_INLINE
 
 #define BAKA_SSE2 1
 
@@ -495,11 +501,11 @@ const size_t FRAME_START_SIZE = sizeof(FRAME_START) - 1;
 #define INT64_SIZE_F(_F) sizeof(_F("+9223372036854775807"))-1
 
 
-#define FRAME_HEADER_STR(_VAL) _VAL", "_VAL", "_VAL", "_VAL", "_VAL", "_VAL", "_VAL", "_VAL", "_VAL", "_VAL"\n"
+#define FRAME_HEADER_STR(_VAL) _VAL", "_VAL", "_VAL", "_VAL", "_VAL", "_VAL", "_VAL", "_VAL", "_VAL", "_VAL", "_VAL", "_VAL"\n"
 #define FRAME_HEADER_FORMAT INT64_FORMAT_F(FRAME_HEADER_STR)
 const size_t FRAME_HEADER_SIZE = INT64_SIZE_F(FRAME_HEADER_STR);
 
-#define FRAME_STATS_STR(_VAL) "B:"_VAL" D:"_VAL" A:"_VAL" R:"_VAL" K:"_VAL" B:"_VAL" G:"_VAL" S:"_VAL"\n"
+#define FRAME_STATS_STR(_VAL) "PTS:"_VAL" DUR:"_VAL" BUF:"_VAL" CPTS:"_VAL" CDUR:"_VAL" DEL:"_VAL" SKP:"_VAL" RCL:"_VAL" DRI:"_VAL" BW:"_VAL" GU:"_VAL" SKP:"_VAL"\n"
 #define FRAME_STATS_FORMAT INT64_FORMAT_F(FRAME_STATS_STR)
 const size_t FRAME_STATS_SIZE = INT64_SIZE_F(FRAME_STATS_STR);
 
@@ -522,7 +528,7 @@ static int DEBUG_ATTR baka_draw_display(BAKAContext *c) {
         screen += sprintf(screen, "%s", FRAME_START);
         // printf("0m%+012ld, %012ld\n", c->pts, c->duration);
     }
-    screen += sprintf(screen, FRAME_HEADER_FORMAT, c->pts_rel, c->duration, c->buffer_ticks, c->stats_delay, c->lag_skipahead, c->count_reclock, c->reclock_drift, c->count_backwards, c->count_guess, c->count_skip);
+    screen += sprintf(screen, FRAME_HEADER_FORMAT, c->pts_rel, c->duration, c->buffer_ticks, c->canonical_pts_rel, c->canonical_duration, c->stats_delay, c->lag_skipahead, c->count_reclock, c->reclock_drift, c->count_backwards, c->count_guess, c->count_skip);
     // if (c->syncstats) {
     //   screen += sprintf(screen, FRAME_STATS_FORMAT, c->stats_delay, c->lag_skipahead, c->count_reclock, c->reclock_drift, c->count_backwards, c->count_guess, c->count_skip);
     // }
@@ -693,12 +699,14 @@ static int DEBUG_ATTR baka_write_header(AVFormatContext *s) {
     c->time_base = st->time_base;
     c->duration_nominal = av_rescale_q(1, c->time_base, AV_TIME_BASE_Q);
     c->duration_last = c->duration_nominal;
+    c->canonical_duration_last= c->duration_nominal;
     c->ticks_first_frame = 0;
     c->pts_first_frame = 0;
 
     c->last_draw_time = 0;
     c->last_present_time = 0;
     c->last_pts_rel = 0;
+    c->canonical_last_pts_rel = 0;
 
     c->lag_skipahead = 0;
 
@@ -743,24 +751,24 @@ static int DEBUG_ATTR baka_write_packet(AVFormatContext *s, AVPacket *pkt) {
     int64_t packet_lag;
     int64_t frametime_half;
 
-    c->pts = av_rescale_q(pkt->pts, c->time_base, AV_TIME_BASE_Q);
-    // Adjust the timestamp based on buffer:
-    c->pts += c->buffer_ticks;
+    c->canonical_pts = av_rescale_q(pkt->pts, c->time_base, AV_TIME_BASE_Q);
+
+
 
     // Set frame duration
     if (pkt->duration > 0) {
-      c->duration = av_rescale_q(pkt->duration, c->time_base, AV_TIME_BASE_Q);
+      c->canonical_duration = av_rescale_q(pkt->duration, c->time_base, AV_TIME_BASE_Q);
     } else {
       // Guess frame duration based on last / nominal
-      c->duration = c->duration_last;
+      c->canonical_duration = c->canonical_duration_last;
       c->count_guess++;
     }
 
     // Set pts_rel to be always monotonic
     if (c->ticks_first_frame && (
-      c->pts - c->pts_first_frame < c->last_pts_rel
+      c->canonical_pts - c->pts_first_frame < c->canonical_last_pts_rel
     )) { // Time went backwards! (loaded another chunk of an HLSL stream)
-      c->pts_first_frame = c->pts - c->last_pts_rel - c->duration_last;
+      c->pts_first_frame = c->canonical_pts - c->canonical_last_pts_rel - c->canonical_duration_last;
       // We are going to set c->pts_rel = c->pts - c->pts_first_frame;
       // Therefore
       // c->pts_rel = c->pts - (c->pts - c->last_pts_rel - c->duration_last);
@@ -769,10 +777,10 @@ static int DEBUG_ATTR baka_write_packet(AVFormatContext *s, AVPacket *pkt) {
       // c->stats_reclock_drift += (c->pts_first_frame - pts_first_frame_prev);
       c->count_backwards++;
     }
-    c->pts_rel = c->pts - c->pts_first_frame;
+    c->canonical_pts_rel = c->canonical_pts - c->pts_first_frame;
 
     // Adjust frame duration (VFR stream)
-    clock_drift = (c->pts_rel - c->last_pts_rel) - c->duration_last;
+    clock_drift = (c->canonical_pts_rel - c->canonical_last_pts_rel) - c->canonical_duration_last;
     if (c->ticks_first_frame && clock_drift) {
       /*
       Inconsistent last frame timestamps and durations!
@@ -787,11 +795,16 @@ static int DEBUG_ATTR baka_write_packet(AVFormatContext *s, AVPacket *pkt) {
       Then we have pts0 + duration = pts1 precisely for all frames
       */
       c->count_reclock++;
-      c->duration += clock_drift;
-      c->pts_rel -= clock_drift;
-      // c->pts -= clock_drift; // for consistency
+      c->canonical_duration += clock_drift;
+      c->canonical_pts_rel -= clock_drift;
+      // c->canonical_pts -= clock_drift; // for consistency // actually don't
       c->reclock_drift += clock_drift;
     }
+
+    // Adjustment based on buffer
+    c->pts = c->canonical_pts + c->buffer_ticks;
+    c->pts_rel = c->canonical_pts_rel + c->buffer_ticks;
+    c->duration = c->canonical_duration;
 
     // Buffering by adjusting pts timestamps
     if (c->sync && c->ticks_first_frame &&
@@ -857,7 +870,7 @@ static int DEBUG_ATTR baka_write_packet(AVFormatContext *s, AVPacket *pkt) {
 
       if (!c->ticks_first_frame) {
         c->ticks_first_frame = ticks_pts_end;
-        c->pts_first_frame = c->pts;
+        c->pts_first_frame = c->canonical_pts;
       }
 
       if (c->sync) {
@@ -875,7 +888,9 @@ static int DEBUG_ATTR baka_write_packet(AVFormatContext *s, AVPacket *pkt) {
     }
 
     c->duration_last = c->duration;
+    c->canonical_duration_last = c->canonical_duration;
     c->last_pts_rel = c->pts_rel;
+    c->canonical_last_pts_rel = c->canonical_pts_rel;
 
     return 0;
 }
